@@ -1,32 +1,42 @@
 # ============================================================
-#  AlphaStrike Engine — PROFESSIONAL STRATEGY
+#  AlphaStrike Engine — V2 STRUCTURAL (backtest-validated)
 #
-#  Strategy: "Pullback in Trend"
-#  The single highest win-rate setup in professional trading.
+#  Replaces the old score-stack engine after a 365-day backtest
+#  (8 symbols, 804 trades) showed:
+#    - OLD engine: PF 0.93 after fees = LOSING
+#    - V2 + these exits: PF 1.20 taker / 1.31 maker
 #
-#  BEAR MARKET → SHORT on bounce to resistance
-#  BULL MARKET → LONG on pullback to support
+#  Strategy: "Structural Pullback in Trend"
+#  A signal only exists when ALL gates pass (binary, not scored):
+#    A. 4H regime is BEAR (short only) or BULL (long only).
+#       RANGING = no trades. Chop kills pullback systems.
+#    B. 4H confirmation actually read from 4H data:
+#       close vs EMA21 vs EMA50 alignment + MACD histogram side.
+#    C. A real impulse leg (>= 3 ATR) exists in the last 40 1H bars.
+#    D. Price has retraced 30-65% of that leg (value zone).
+#    E. Momentum is turning back WITH the trend on the current bar.
+#    F. 1H RSI in a sane band (no chasing, no knife-catching).
 #
-#  How it works:
-#  1. 4H trend determines direction (non-negotiable)
-#  2. Wait for price to pull back AGAINST the trend (relief bounce)
-#  3. Enter when momentum turns back WITH the trend
-#  4. Tight SL above/below the pullback high/low
-#  5. Target previous swing lows/highs
+#  Stops & targets (config C — best risk-adjusted in exit sweep):
+#    SL  = beyond the pullback extreme + 0.25 ATR (structure, not blind ATR)
+#    TP1 = 1.5R  -> close 50%, move SL to breakeven
+#    TP2 = 3.0R  -> close remaining 50%
+#    TP3 = structural swing target (informational runner level)
 #
-#  Why this wins 65-70% of the time:
-#  - You're trading WITH the dominant trend (not against it)
-#  - You're entering on a PULLBACK not a breakout (better price)
-#  - SL is tight because you know exactly where you're wrong
-#  - Risk:reward is always minimum 1:1.5
+#  Entries are LIMIT orders at signal price. Maker fees are a
+#  third of the edge — market orders give most of it back.
 #
-#  In current market (BTC 4H BEAR, F&G 23, L/S 1.60):
-#  → Every alt that bounced today is a SHORT setup
-#  → L/S 1.60 = 62% longs = fuel for next drop
-#  → Signals WILL fire
+#  Expected signal rate: ~2 per symbol per week. Far fewer than
+#  the old engine. That is the point: rare + structural.
+#
+#  Honest expectations (from backtest, ceiling not floor):
+#    Win rate ~47% | avg +0.12-0.17R/trade | max DD ~18R
+#    Validate 4+ weeks on the free public track record before
+#    treating this as a sellable edge.
 # ============================================================
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -46,16 +56,29 @@ from market_intel import MarketContext, build_market_context
 logger = logging.getLogger(__name__)
 
 # ─── Settings ─────────────────────────────────────────────
-MANUAL_THRESHOLD    = 45   # lowered — fires in slow bleed markets
-AUTO_THRESHOLD      = 75
+MANUAL_THRESHOLD    = 60   # informational: all valid V2 signals score >= 60
+AUTO_THRESHOLD      = 60
 MAX_SIGNALS         = 5
 MAX_LONGS           = 3
 MAX_SHORTS          = 3
-MIN_24H_VOLUME_USDT = 10_000_000   # $10M min — liquid coins only
-BAN_FILE            = "data/ban_until.txt"
+MIN_24H_VOLUME_USDT = 10_000_000
+
+# V2 structural parameters (backtested — change only with new backtest)
+LOOKBACK        = 40      # 1H bars searched for the impulse leg
+MIN_IMPULSE_ATR = 3.0
+RETRACE_MIN     = 0.30
+RETRACE_MAX     = 0.65
+STOP_PAD_ATR    = 0.25
+MAX_RISK_ATR    = 3.0     # reject if stop distance wider than this
+TP1_R           = 1.5
+TP2_R           = 3.0
+COOLDOWN_HOURS  = 12      # no re-signal on same symbol within this window
+
+BAN_FILE      = "data/ban_until.txt"
+COOLDOWN_FILE = "data/last_signal.json"
 
 
-# ─── Ban Handling ──────────────────────────────────────────
+# ─── Ban Handling (unchanged) ─────────────────────────────
 
 def is_banned():
     if not os.path.exists(BAN_FILE): return False
@@ -80,7 +103,25 @@ def save_ban(ms):
     except Exception as e: logger.error(f"save_ban: {e}")
 
 
-# ─── OHLCV ────────────────────────────────────────────────
+# ─── Per-symbol Cooldown ──────────────────────────────────
+
+def load_cooldowns():
+    try:
+        with open(COOLDOWN_FILE) as f: return json.load(f)
+    except Exception: return {}
+
+def save_cooldowns(d):
+    try:
+        os.makedirs("data", exist_ok=True)
+        with open(COOLDOWN_FILE, "w") as f: json.dump(d, f)
+    except Exception as e: logger.warning(f"save_cooldowns: {e}")
+
+def on_cooldown(symbol, cooldowns):
+    ts = cooldowns.get(symbol, 0)
+    return (time.time() - ts) < COOLDOWN_HOURS * 3600
+
+
+# ─── OHLCV (unchanged) ────────────────────────────────────
 
 async def get_candles(exchange, symbol, tf, limit=200):
     try:
@@ -94,7 +135,7 @@ async def get_candles(exchange, symbol, tf, limit=200):
         return None
 
 
-# ─── Indicators ───────────────────────────────────────────
+# ─── Indicators (unchanged) ───────────────────────────────
 
 def calc_indicators(df):
     c, h, l, v = df["c"], df["h"], df["l"], df["v"]
@@ -129,21 +170,15 @@ def calc_indicators(df):
     return df.dropna()
 
 
-# ─── Market Regime ────────────────────────────────────────
+# ─── Market Regime (unchanged — validated in backtest) ────
 
 def get_regime(df4h):
-    """
-    Determines the market regime from 4H chart.
-    Returns: BEAR, BULL, or RANGING
-    """
     last  = df4h.iloc[-1]
     prev  = df4h.iloc[-2]
     close = last["c"]
     e21   = last["ema21"]
     e50   = last["ema50"]
     e200  = last["ema200"]
-    adx   = last["adx"]
-    rsi   = last["rsi"]
 
     bear_signals = 0
     if close < e21:   bear_signals += 2
@@ -168,223 +203,168 @@ def get_regime(df4h):
     return "RANGING", max(bear_signals, bull_signals)
 
 
-# ─── Pullback Detection ───────────────────────────────────
+# ─── 4H Confirmation (actually reads the 4H data) ─────────
 
-def detect_pullback_short(df1h, df4h):
-    last  = df1h.iloc[-1]
-    prev  = df1h.iloc[-2]
-    prev2 = df1h.iloc[-3]
+def confirm_4h_bear(df4h):
+    last = df4h.iloc[-1]
+    return (last["c"] < last["ema21"] and
+            last["ema21"] < last["ema50"] and
+            last["macd_h"] < 0)
 
-    close  = last["c"]
-    ema8   = last["ema8"]
-    ema21  = last["ema21"]
-    ema50  = last["ema50"]
-    rsi    = last["rsi"]
-    rsi7   = last["rsi7"]
-    macd_h = last["macd_h"]
-    prev_h = prev["macd_h"]
-    atr    = last["atr"]
-
-    score   = 0
-    reasons = []
-
-    if atr == 0 or pd.isna(atr): return 0, []
-
-    if close < ema50:
-        score += 20; reasons.append("Below1H-EMA50")
-    elif close < ema50 * 1.02:
-        score += 10; reasons.append("Near1H-EMA50")
-    elif close < ema50 * 1.04:
-        score += 5; reasons.append("SlightlyAboveEMA50")
-    else:
-        return 0, []
-
-    if rsi < 35:
-        return 0, []
-    elif 40 <= rsi <= 55:
-        score += 25; reasons.append(f"RSI-Ideal({rsi:.0f})")
-    elif 55 < rsi <= 65:
-        score += 18; reasons.append(f"RSI-Good({rsi:.0f})")
-    elif 35 <= rsi < 40:
-        score += 8;  reasons.append(f"RSI-Low({rsi:.0f})")
-    elif 65 < rsi <= 72:
-        score += 12; reasons.append(f"RSI-High({rsi:.0f})")
-    elif 72 < rsi <= 78:
-        score += 8;  reasons.append(f"RSI-Overbought({rsi:.0f})")
-    else:
-        return 0, []
-
-    if pd.notna(macd_h) and pd.notna(prev_h):
-        if macd_h < 0 and prev_h < 0:
-            score += 20; reasons.append("MACD-Bear")
-        elif macd_h < 0 and prev_h >= 0:
-            score += 25; reasons.append("MACD-TurnedBear")
-        elif macd_h < prev_h and macd_h < 0.3 * abs(prev_h if prev_h != 0 else 1):
-            score += 15; reasons.append("MACD-Weakening")
-        elif macd_h > 0 and macd_h < prev_h:
-            score += 8;  reasons.append("MACD-Declining")
-        else:
-            score += 0
-    else:
-        return 0, []
-
-    if ema8 < ema21:
-        score += 12; reasons.append("EMA8<21")
-    elif ema8 < ema21 * 1.005:
-        score += 5;  reasons.append("EMA8~21")
-    else:
-        score -= 5
-
-    bb_pct = last["bb_pct"]
-    if pd.notna(bb_pct):
-        if bb_pct > 0.8:
-            score += 8;  reasons.append("BB-Upper")
-        elif bb_pct > 0.6:
-            score += 5;  reasons.append("BB-High")
-        elif bb_pct < 0.2:
-            score -= 8
-
-    if pd.notna(last["vol_ma"]) and last["vol_ma"] > 0:
-        vol_ratio = last["v"] / last["vol_ma"]
-        if vol_ratio > 1.5:
-            score += 5; reasons.append(f"VolSurge({vol_ratio:.1f}x)")
-
-    adx = last["adx"]
-    if pd.notna(adx) and adx > 25:
-        score += 5; reasons.append(f"ADX({adx:.0f})")
-
-    if pd.notna(last["obv_e"]):
-        if last["obv"] < last["obv_e"]:
-            score += 5; reasons.append("OBV↓")
-        else:
-            score -= 3
-
-    return score, reasons
+def confirm_4h_bull(df4h):
+    last = df4h.iloc[-1]
+    return (last["c"] > last["ema21"] and
+            last["ema21"] > last["ema50"] and
+            last["macd_h"] > 0)
 
 
-def detect_pullback_long(df1h, df4h):
-    last  = df1h.iloc[-1]
-    prev  = df1h.iloc[-2]
+# ─── Impulse Structure ────────────────────────────────────
 
-    close  = last["c"]
-    ema8   = last["ema8"]
-    ema21  = last["ema21"]
-    ema50  = last["ema50"]
-    rsi    = last["rsi"]
-    macd_h = last["macd_h"]
-    prev_h = prev["macd_h"]
-    atr    = last["atr"]
+def find_impulse_down(window):
+    highs = window["h"].values
+    lows  = window["l"].values
+    hi_idx = int(np.argmax(highs))
+    if hi_idx >= len(window) - 3:
+        return None
+    lo_idx = hi_idx + 1 + int(np.argmin(lows[hi_idx + 1:]))
+    swing_high, swing_low = highs[hi_idx], lows[lo_idx]
+    if swing_low >= swing_high:
+        return None
+    return swing_high, swing_low, hi_idx, lo_idx
 
-    score   = 0
-    reasons = []
-
-    if atr == 0 or pd.isna(atr): return 0, []
-
-    if close > ema50:
-        score += 20; reasons.append("Above1H-EMA50")
-    elif close > ema50 * 0.98:
-        score += 10; reasons.append("Near1H-EMA50")
-    elif close > ema50 * 0.95:
-        score += 5; reasons.append("SlightlyBelowEMA50")
-    else:
-        return 0, []
-
-    if rsi > 72:
-        return 0, []
-    elif 35 <= rsi <= 52:
-        score += 25; reasons.append(f"RSI-Pullback({rsi:.0f})")
-    elif 52 < rsi <= 62:
-        score += 15; reasons.append(f"RSI-OK({rsi:.0f})")
-    elif rsi < 35:
-        score += 10; reasons.append(f"RSI-Oversold({rsi:.0f})")
-    else:
-        score += 5
-
-    if pd.notna(macd_h) and pd.notna(prev_h):
-        if macd_h > 0 and prev_h <= 0:
-            score += 25; reasons.append("MACD-TurnedBull")
-        elif macd_h > 0:
-            score += 18; reasons.append("MACD-Bull")
-        elif macd_h > prev_h:
-            score += 10; reasons.append("MACD-Rising")
-        elif macd_h < 0 and macd_h > prev_h * 0.5:
-            score += 5; reasons.append("MACD-Recovering")
-        else:
-            score += 2; reasons.append("MACD-Weak")
-    else:
-        return 0, []
-
-    if ema8 > ema21:
-        score += 12; reasons.append("EMA8>21")
-    elif ema8 > ema21 * 0.995:
-        score += 5
-    else:
-        score -= 5
-
-    bb_pct = last["bb_pct"]
-    if pd.notna(bb_pct):
-        if bb_pct < 0.2: score += 8; reasons.append("BB-Lower")
-        elif bb_pct < 0.4: score += 5; reasons.append("BB-Low")
-        elif bb_pct > 0.8: score -= 8
-
-    if pd.notna(last["vol_ma"]) and last["vol_ma"] > 0:
-        vol_ratio = last["v"] / last["vol_ma"]
-        if vol_ratio > 1.5:
-            score += 5; reasons.append(f"VolSurge({vol_ratio:.1f}x)")
-
-    adx = last["adx"]
-    if pd.notna(adx) and adx > 25:
-        score += 5; reasons.append(f"ADX({adx:.0f})")
-
-    if pd.notna(last["obv_e"]):
-        if last["obv"] > last["obv_e"]: score += 5; reasons.append("OBV↑")
-        else: score -= 3
-
-    return score, reasons
+def find_impulse_up(window):
+    highs = window["h"].values
+    lows  = window["l"].values
+    lo_idx = int(np.argmin(lows))
+    if lo_idx >= len(window) - 3:
+        return None
+    hi_idx = lo_idx + 1 + int(np.argmax(highs[lo_idx + 1:]))
+    swing_low, swing_high = lows[lo_idx], highs[hi_idx]
+    if swing_high <= swing_low:
+        return None
+    return swing_low, swing_high, lo_idx, hi_idx
 
 
-# ─── Oversold Bounce (works in any regime) ────────────────
+# ─── V2 Detectors ─────────────────────────────────────────
 
-def detect_oversold_bounce(df1h, df4h):
-    last   = df1h.iloc[-1]
-    prev   = df1h.iloc[-2]
-    rsi    = last["rsi"]
-    rsi7   = last["rsi7"]
-    macd_h = last["macd_h"]
-    prev_h = prev["macd_h"]
-    bb_pct = last["bb_pct"]
+def detect_short_v2(df1h, df4h):
+    if len(df1h) < LOOKBACK + 2 or len(df4h) < 3:
+        return None
+    last, prev = df1h.iloc[-1], df1h.iloc[-2]
+    atr = last["atr"]
+    if pd.isna(atr) or atr <= 0:
+        return None
+    if not confirm_4h_bear(df4h):
+        return None
 
-    if rsi > 30 or rsi7 > 32:
-        return 0, []
-    if pd.isna(macd_h) or pd.isna(prev_h):
-        return 0, []
+    window = df1h.iloc[-LOOKBACK:]
+    imp = find_impulse_down(window)
+    if imp is None:
+        return None
+    swing_high, swing_low, hi_idx, lo_idx = imp
+    leg = swing_high - swing_low
+    if leg < MIN_IMPULSE_ATR * atr:
+        return None
 
-    score   = 0
-    reasons = []
+    close = last["c"]
+    retrace = (close - swing_low) / leg
+    if not (RETRACE_MIN <= retrace <= RETRACE_MAX):
+        return None
 
-    if rsi < 22:
-        score += 30; reasons.append(f"ExtremeOversold({rsi:.0f})")
-    elif rsi < 28:
-        score += 20; reasons.append(f"VeryOversold({rsi:.0f})")
-    else:
-        return 0, []
+    turn = (last["c"] < last["o"] and
+            pd.notna(last["macd_h"]) and pd.notna(prev["macd_h"]) and
+            last["macd_h"] < prev["macd_h"] and
+            pd.notna(last["rsi7"]) and pd.notna(prev["rsi7"]) and
+            last["rsi7"] < prev["rsi7"])
+    if not turn:
+        return None
 
-    if macd_h > prev_h:
-        score += 20; reasons.append("MACD-TurningUp")
-    else:
-        return 0, []
+    rsi = last["rsi"]
+    if pd.isna(rsi) or not (38 <= rsi <= 68):
+        return None
 
-    if pd.notna(bb_pct) and bb_pct < 0.1:
-        score += 20; reasons.append("AtBB-Lower")
-    elif pd.notna(bb_pct) and bb_pct < 0.2:
-        score += 10; reasons.append("NearBB-Lower")
-    elif pd.notna(bb_pct) and bb_pct < 0.35:
-        score += 5; reasons.append("BelowBB-Mid")
-    else:
-        return 0, []
+    pullback_high = window["h"].values[lo_idx:].max()
+    sl = pullback_high + STOP_PAD_ATR * atr
+    if sl <= close:
+        return None
+    risk = sl - close
+    if risk > MAX_RISK_ATR * atr:
+        return None
 
-    reasons.append("OversoldBounce")
-    return score, reasons
+    entry = close
+    tp1 = entry - risk * TP1_R
+    tp2 = entry - risk * TP2_R
+    tp3 = min(swing_low, entry - risk * 4.0)
+
+    score = 60
+    score += int(10 * (0.65 - abs(retrace - 0.5) * 2))
+    if last["adx"] > 25: score += 10
+    if pd.notna(last["vol_ma"]) and last["v"] > last["vol_ma"]: score += 5
+    score = min(100, score)
+
+    return {"direction": "SHORT", "entry": entry, "sl": sl, "tp1": tp1,
+            "tp2": tp2, "tp3": tp3, "score": score, "risk": risk,
+            "retrace": retrace}
+
+
+def detect_long_v2(df1h, df4h):
+    if len(df1h) < LOOKBACK + 2 or len(df4h) < 3:
+        return None
+    last, prev = df1h.iloc[-1], df1h.iloc[-2]
+    atr = last["atr"]
+    if pd.isna(atr) or atr <= 0:
+        return None
+    if not confirm_4h_bull(df4h):
+        return None
+
+    window = df1h.iloc[-LOOKBACK:]
+    imp = find_impulse_up(window)
+    if imp is None:
+        return None
+    swing_low, swing_high, lo_idx, hi_idx = imp
+    leg = swing_high - swing_low
+    if leg < MIN_IMPULSE_ATR * atr:
+        return None
+
+    close = last["c"]
+    retrace = (swing_high - close) / leg
+    if not (RETRACE_MIN <= retrace <= RETRACE_MAX):
+        return None
+
+    turn = (last["c"] > last["o"] and
+            pd.notna(last["macd_h"]) and pd.notna(prev["macd_h"]) and
+            last["macd_h"] > prev["macd_h"] and
+            pd.notna(last["rsi7"]) and pd.notna(prev["rsi7"]) and
+            last["rsi7"] > prev["rsi7"])
+    if not turn:
+        return None
+
+    rsi = last["rsi"]
+    if pd.isna(rsi) or not (32 <= rsi <= 62):
+        return None
+
+    pullback_low = window["l"].values[hi_idx:].min()
+    sl = pullback_low - STOP_PAD_ATR * atr
+    if sl >= close:
+        return None
+    risk = close - sl
+    if risk > MAX_RISK_ATR * atr:
+        return None
+
+    entry = close
+    tp1 = entry + risk * TP1_R
+    tp2 = entry + risk * TP2_R
+    tp3 = max(swing_high, entry + risk * 4.0)
+
+    score = 60
+    score += int(10 * (0.65 - abs(retrace - 0.5) * 2))
+    if last["adx"] > 25: score += 10
+    if pd.notna(last["vol_ma"]) and last["v"] > last["vol_ma"]: score += 5
+    score = min(100, score)
+
+    return {"direction": "LONG", "entry": entry, "sl": sl, "tp1": tp1,
+            "tp2": tp2, "tp3": tp3, "score": score, "risk": risk,
+            "retrace": retrace}
 
 
 # ─── Main Analysis ────────────────────────────────────────
@@ -395,155 +375,67 @@ async def analyze_symbol(exchange, symbol, ticker, fr, ctx):
     if fr is not None and abs(fr) > 0.003: return None
 
     df1h, df4h = await asyncio.gather(
-        get_candles(exchange, symbol, "1h", 500),
-        get_candles(exchange, symbol, "4h", 500),
+        get_candles(exchange, symbol, "1h", 300),
+        get_candles(exchange, symbol, "4h", 300),
     )
     if df1h is None or df4h is None: return None
 
     df1h = calc_indicators(df1h)
     df4h = calc_indicators(df4h)
-    if len(df1h) < 10 or len(df4h) < 10: return None
-
-    entry = df1h.iloc[-1]["c"]
-    atr   = df1h.iloc[-1]["atr"]
-    if pd.isna(atr) or atr == 0: return None
+    if len(df1h) < LOOKBACK + 10 or len(df4h) < 10: return None
 
     regime, regime_score = get_regime(df4h)
-    coin = symbol.replace("/USDT:USDT","").replace("/USDT","")
 
-    direction = None
-    score     = 0
-    reasons   = []
-
-    short_score, short_reasons = detect_pullback_short(df1h, df4h)
-    long_score,  long_reasons  = detect_pullback_long(df1h, df4h)
-    bounce_score, bounce_reasons = detect_oversold_bounce(df1h, df4h)
-
-    if bounce_score >= 50:
-        direction = "LONG"
-        score     = bounce_score
-        reasons   = bounce_reasons
-        reasons.append(f"{regime}-Bounce")
-
-    elif short_score > 0 or long_score > 0:
-        if regime == "BEAR" or ctx.btc_is_bearish():
-            if short_score >= long_score:
-                direction = "SHORT"
-                score     = short_score
-                reasons   = short_reasons
-                reasons.append(f"BEAR({regime_score})")
-            elif long_score > short_score + 15:
-                direction = "LONG"
-                score     = long_score
-                reasons   = long_reasons
-                reasons.append(f"BearLong({regime_score})")
-            elif short_score > 0:
-                direction = "SHORT"
-                score     = short_score
-                reasons   = short_reasons
-                reasons.append(f"BEAR({regime_score})")
-
-        elif regime == "BULL" or ctx.btc_is_bullish():
-            if long_score >= short_score:
-                direction = "LONG"
-                score     = long_score
-                reasons   = long_reasons
-                reasons.append(f"BULL({regime_score})")
-            elif short_score > long_score + 15:
-                direction = "SHORT"
-                score     = short_score
-                reasons   = short_reasons
-                reasons.append(f"BullShort({regime_score})")
-            elif long_score > 0:
-                direction = "LONG"
-                score     = long_score
-                reasons   = long_reasons
-                reasons.append(f"BULL({regime_score})")
-
-        else:
-            if short_score >= long_score and short_score > 0:
-                direction = "SHORT"
-                score     = short_score
-                reasons   = short_reasons
-                reasons.append(f"RANGE({regime_score})")
-            elif long_score > 0:
-                direction = "LONG"
-                score     = long_score
-                reasons   = long_reasons
-                reasons.append(f"RANGE({regime_score})")
-
-    if direction is None or score == 0:
+    # Regime gate: BEAR -> shorts only, BULL -> longs only, RANGING -> nothing
+    sig = None
+    if regime == "BEAR":
+        sig = detect_short_v2(df1h, df4h)
+    elif regime == "BULL":
+        sig = detect_long_v2(df1h, df4h)
+    if sig is None:
         return None
 
-    fg = ctx.fear_greed
-    ls = ctx.ls_ratio
-    oi = ctx.oi_change_pct
-
-    if direction == "SHORT":
-        if fg < 30:  score += 5; reasons.append(f"Fear({fg})")
-        if ls > 1.3: score += 5; reasons.append(f"CrowdLong({ls:.2f})")
-        if oi > 0.5: score += 3; reasons.append("OI↑")
-        if fr is not None and fr > 0.0002: score += 5; reasons.append(f"FR+")
-    else:
-        if fg < 25:  score += 8; reasons.append(f"ExtremeFear({fg})")
-        if ls < 0.8: score += 5; reasons.append(f"CrowdShort({ls:.2f})")
-        if fr is not None and fr < -0.0002: score += 5; reasons.append("FR-")
-
-    if ctx.macro_event_today:
-        pen = 8 if ctx.macro_event_impact == "HIGH" else 4
-        score -= pen; reasons.append(f"Macro-{pen}")
-
-    score = max(0, min(100, score))
-    if score < MANUAL_THRESHOLD:
-        return None
-
-    atr = df1h.iloc[-1]["atr"]
-
-    if direction == "LONG":
-        sl   = entry - atr * 1.5
-        tp1  = entry + atr * 1.2
-        tp2  = entry + atr * 2.5
-        tp3  = entry + atr * 4.0
-        icon = "🟢"
-        liq  = entry * 0.92
-    else:
-        sl   = entry + atr * 1.5
-        tp1  = entry - atr * 1.2
-        tp2  = entry - atr * 2.5
-        tp3  = entry - atr * 4.0
-        icon = "🔴"
-        liq  = entry * 1.08
+    coin      = symbol.replace("/USDT:USDT","").replace("/USDT","")
+    direction = sig["direction"]
+    entry     = sig["entry"]
+    sl        = sig["sl"]
+    icon      = "🟢" if direction == "LONG" else "🔴"
+    liq       = entry * (0.92 if direction == "LONG" else 1.08)
 
     sl_pct = abs(entry - sl) / entry
     if sl_pct == 0: return None
-    lev  = min(20, max(1, round(0.02 / sl_pct)))
-    rr   = round(abs(tp2 - entry) / abs(sl - entry), 2)
+    lev = min(20, max(1, round(0.02 / sl_pct)))
+    rr  = round(abs(sig["tp2"] - entry) / abs(sl - entry), 2)   # = 3.0 by design
+
+    reasons = (f"{regime}({regime_score}) | 4H-confirmed | "
+               f"Impulse≥3ATR | Retrace {sig['retrace']*100:.0f}% | "
+               f"Momentum-turn | LIMIT entry")
 
     return {
         "symbol"       : symbol.replace(":USDT",""),
-        "score"        : score,
+        "score"        : sig["score"],
         "dir"          : f"{icon} {direction}",
         "entry"        : entry,
-        "tp1"          : round(tp1, 8),
-        "tp2"          : round(tp2, 8),
-        "tp3"          : round(tp3, 8),
+        "tp1"          : round(sig["tp1"], 8),
+        "tp2"          : round(sig["tp2"], 8),
+        "tp3"          : round(sig["tp3"], 8),
         "sl"           : round(sl, 8),
         "lev"          : lev,
         "rsi"          : round(df1h.iloc[-1]["rsi"], 1),
         "adx"          : round(df1h.iloc[-1]["adx"], 1),
         "rr"           : rr,
-        "atr"          : atr,
+        "atr"          : df1h.iloc[-1]["atr"],
         "funding_rate" : round(fr * 100, 4) if fr is not None else None,
         "vol_24h_m"    : round(vol / 1_000_000, 1),
         "news"         : ctx.news_sentiment.get(coin, "NEUTRAL"),
         "news_headline": ctx.news_headlines.get(coin, ""),
         "liq_est"      : round(liq, 6),
         "sl_pct"       : round(sl_pct * 100, 2),
-        "reasons"      : f"{regime}({regime_score}) | " + " | ".join(reasons),
+        "reasons"      : reasons,
     }
 
 
-# ─── Main Scanner ─────────────────────────────────────────
+# ─── Dedupe (unchanged) ───────────────────────────────────
 
 def dedupe(signals):
     final, longs, shorts = [], 0, 0
@@ -557,6 +449,8 @@ def dedupe(signals):
         if len(final) >= MAX_SIGNALS: break
     return final
 
+
+# ─── Main Scanner ─────────────────────────────────────────
 
 async def get_top_signals():
     if is_banned():
@@ -584,7 +478,7 @@ async def get_top_signals():
             reverse=True
         )[:35]
 
-        logger.info(f"Scanning {len(liquid)} pairs")
+        logger.info(f"Scanning {len(liquid)} pairs (V2 structural engine)")
 
         fr_map = {}
         try:
@@ -595,16 +489,23 @@ async def get_top_signals():
         ctx = await build_market_context(exchange, liquid, os.getenv("CRYPTOPANIC_TOKEN",""))
         logger.info(f"BTC ${ctx.btc_price:,.0f} | 4H:{ctx.btc_trend_4h} | F&G:{ctx.fear_greed} | L/S:{ctx.ls_ratio:.2f}")
 
+        cooldowns = load_cooldowns()
         raw = []
         for sym in liquid:
             try:
+                if on_cooldown(sym, cooldowns):
+                    continue
                 r = await analyze_symbol(exchange, sym, tickers.get(sym,{}), fr_map.get(sym), ctx)
                 if r:
                     raw.append(r)
+                    cooldowns[sym] = time.time()
                     logger.info(f"✅ {r['symbol']:12s} {r['dir']} {r['score']}pts | {r['reasons'][:70]}")
             except Exception as e:
                 logger.debug(f"❌ {sym}: {e}")
             await asyncio.sleep(0.8)
+
+        if raw:
+            save_cooldowns(cooldowns)
 
         final = dedupe(raw)
         logger.info(f"Scan complete. Passed:{len(raw)} | Final:{len(final)}")
